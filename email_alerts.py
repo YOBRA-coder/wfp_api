@@ -48,7 +48,7 @@ class Config:
     SMTP_USER:     str = os.getenv("SMTP_USER",     "your@gmail.com")
     SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "your_app_password")
     FROM_NAME:     str = os.getenv("FROM_NAME",     "ForexPro Signals")
-    API_BASE:      str = os.getenv("API_BASE",      "http://localhost:8766")
+    API_BASE:      str = os.getenv("API_BASE",      "https://wfp-api.onrender.com")
     API_EMAIL:     str = os.getenv("API_EMAIL",     "provider@forexpro.com")
     API_PASSWORD:  str = os.getenv("API_PASSWORD",  "demo123")
     POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "60"))

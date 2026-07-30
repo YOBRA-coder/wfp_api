@@ -17,7 +17,7 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "brianrotich909@gmail.com")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "qcdf tyjs amft dkjt")
 FROM_NAME = os.getenv("FROM_NAME", "YobbyForex")
-APP_URL = os.getenv("APP_URL", "http://localhost:5173")
+APP_URL = os.getenv("APP_URL", "https://wfp-ui.vercel.app")
 
 
 def email_configured() -> bool:
