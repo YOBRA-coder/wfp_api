@@ -162,7 +162,7 @@ async def customer_portal(req: PortalReq):
 async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     """
     Handles Stripe webhook events.
-    Run: stripe listen --forward-to localhost:8766/payments/webhook
+    Run: stripe listen --forward-to https://wfp-api.onrender.com/payments/webhook
     """
     body = await request.body()
 
