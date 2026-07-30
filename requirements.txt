@@ -9,3 +9,5 @@ pywebpush>=2.0
 py-vapid>=1.9
 aiohttp>=3.9
 python-telegram-bot>=21.0
+aiosmtplib 
+jinja2
