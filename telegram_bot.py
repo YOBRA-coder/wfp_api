@@ -38,8 +38,8 @@ from telegram.ext import (
 )
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-API_BASE           = os.getenv("API_BASE", "http://localhost:8766")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8719051961:AAGm9q124QT0nLM7MVEo8Koozvu6zBpQnPo")
+API_BASE           = os.getenv("API_BASE", "https://wfp-api.onrender.com")
 API_EMAIL          = os.getenv("API_EMAIL", "provider@forexpro.com")
 API_PASSWORD       = os.getenv("API_PASSWORD", "demo123")
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL", "60"))  # seconds

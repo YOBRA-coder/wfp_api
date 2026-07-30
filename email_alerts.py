@@ -45,8 +45,8 @@ from dataclasses import dataclass
 class Config:
     SMTP_HOST:     str = os.getenv("SMTP_HOST",     "smtp.gmail.com")
     SMTP_PORT:     int = int(os.getenv("SMTP_PORT", "587"))
-    SMTP_USER:     str = os.getenv("SMTP_USER",     "your@gmail.com")
-    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "your_app_password")
+    SMTP_USER:     str = os.getenv("SMTP_USER",     "brianrotich909@gmail.com")
+    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "qcdf tyjs amft dkjt")
     FROM_NAME:     str = os.getenv("FROM_NAME",     "ForexPro Signals")
     API_BASE:      str = os.getenv("API_BASE",      "https://wfp-api.onrender.com")
     API_EMAIL:     str = os.getenv("API_EMAIL",     "provider@forexpro.com")
