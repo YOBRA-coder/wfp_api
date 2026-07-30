@@ -29,7 +29,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 
-from backend.trade_close import apply_trade_close
+from trade_close import apply_trade_close
 from database import get_db, generate_bridge_token, recompute_provider_stats
 from auth import get_current_user
 
