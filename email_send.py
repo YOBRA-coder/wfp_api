@@ -13,7 +13,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "brianrotich909@gmail.com")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "qcdf tyjs amft dkjt")
 FROM_NAME = os.getenv("FROM_NAME", "YobbyForex")
