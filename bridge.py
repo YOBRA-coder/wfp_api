@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from trade_close import apply_trade_close
 from database import get_db, generate_bridge_token, recompute_provider_stats
 from auth import get_current_user
+from push_send import notify_user
 
 router = APIRouter(prefix="/bridge", tags=["mt5-bridge"])
 
@@ -44,6 +45,40 @@ def get_bridge_user(token: str = Query(..., description="Per-user bridge token f
         if not user:
             raise HTTPException(401, "Invalid or unknown bridge token")
         return dict(user)
+
+
+def check_stale_bridges(db):
+    """Watchdog: alert anyone whose MT5 EA has gone quiet. If a client is
+    relying on live copy trading and their terminal disconnects (closed,
+    crashed, PC off, internet down), signals simply stop executing on their
+    real account with no visible error — this is the one bridge event that
+    genuinely needs a push, not just an in-app row, since it's silent
+    otherwise. Called from the main settlement loop every ~20s; the
+    'notifications' dupe-check keeps it to one alert per outage, not one
+    every loop tick."""
+    cutoff = (datetime.now() - timedelta(seconds=HEARTBEAT_STALE_SECONDS)).isoformat()
+    rows = db.execute("""
+        SELECT id, bridge_connected_at FROM users
+        WHERE bridge_token IS NOT NULL AND bridge_token != ''
+          AND bridge_connected_at IS NOT NULL AND bridge_connected_at < ?
+    """, (cutoff,)).fetchall()
+    for row in rows:
+        has_open = db.execute("""
+            SELECT 1 FROM copy_trades WHERE follower_id=? AND execution_mode='mt5'
+              AND status IN ('open','pending_bridge') LIMIT 1
+        """, (row["id"],)).fetchone()
+        if not has_open:
+            continue  # nothing riding on the bridge right now — don't alarm them for nothing
+        dupe = db.execute("""
+            SELECT 1 FROM notifications WHERE user_id=? AND title='MT5 bridge disconnected ⚠️'
+              AND created_at > datetime('now','-30 minutes')
+        """, (row["id"],)).fetchone()
+        if dupe:
+            continue
+        notify_user(db, row["id"], "system", "MT5 bridge disconnected ⚠️",
+            "Your MT5 terminal stopped reporting in — live copy trades won't execute until "
+            "it reconnects. Check that MT5 is open and the EA is attached and running.",
+            "/profile")
 
 
 # ── Setup (JWT-authenticated — called from the web app, not the EA) ──────────
@@ -203,13 +238,11 @@ def report_modify(
             db.execute("""UPDATE copy_trades SET stop_loss=?, take_profit=?,
                           modify_requested=0, pending_stop_loss=NULL, pending_take_profit=NULL
                           WHERE id=?""", (new_sl, new_tp, copy_trade_id))
-            db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                (user["id"], "trade_closed", "SL/TP updated", f"New SL {new_sl} / TP {new_tp} confirmed in MT5."))
+            notify_user(db, user["id"], "trade_closed", "SL/TP updated", f"New SL {new_sl} / TP {new_tp} confirmed in MT5.", "/copy")
         else:
             db.execute("UPDATE copy_trades SET modify_requested=0, pending_stop_loss=NULL, pending_take_profit=NULL WHERE id=?",
                        (copy_trade_id,))
-            db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                (user["id"], "trade_closed", "SL/TP change failed", error_msg or "MT5 rejected the change."))
+            notify_user(db, user["id"], "trade_closed", "SL/TP change failed", error_msg or "MT5 rejected the change.", "/copy")
     return {"ok": True}
 
 @router.post("/report-fill")
@@ -254,10 +287,8 @@ def report_close(
         # master trade — cascades to close every linked follower trade too.
         apply_trade_close(db, copy_trade_id, close_price, pnl_pips, pnl_usd, result,
                            "Closed via MT5 (real account)")
-        db.execute("""INSERT INTO notifications (user_id,type,title,message)
-                      VALUES (?,?,?,?)""",
-                   (user["id"], "trade_closed", f"MT5 trade {result.upper()}",
-                    f"Closed at {close_price} · {pnl_pips:+.1f} pips · ${pnl_usd:+.2f} (real account)"))
+        notify_user(db, user["id"], "trade_closed", f"MT5 trade {result.upper()}",
+                    f"Closed at {close_price} · {pnl_pips:+.1f} pips · ${pnl_usd:+.2f} (real account)", "/copy")
         if ct["provider_id"]:
             recompute_provider_stats(db, ct["provider_id"])
     return {"ok": True}

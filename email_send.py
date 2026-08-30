@@ -13,7 +13,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "brianrotich909@gmail.com")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "qcdf tyjs amft dkjt")
 FROM_NAME = os.getenv("FROM_NAME", "YobbyForex")
@@ -35,7 +35,7 @@ def send_email(to_email: str, subject: str, html_body: str) -> bool:
         msg["To"] = to_email
         msg.attach(MIMEText(html_body, "html"))
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.starttls()
+            #server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_USER, to_email, msg.as_string())
         return True
@@ -57,3 +57,19 @@ def send_verification_email(to_email: str, username: str, token: str) -> bool:
     </div>
     """
     return send_email(to_email, "Verify your YobbyForex email", html)
+
+
+def send_password_reset_otp_email(to_email: str, username: str, otp: str) -> bool:
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;background:#0D1318;color:#e2e8f0;border-radius:12px;">
+      <h2 style="color:#F0B429;">Reset your password</h2>
+      <p>Hi {username}, use this code to reset your YobbyForex password:</p>
+      <div style="display:inline-block;background:#111827;border:1px solid #F0B429;color:#F0B429;
+         padding:16px 28px;border-radius:10px;font-size:32px;font-weight:800;letter-spacing:8px;margin:14px 0;">
+        {otp}
+      </div>
+      <p style="font-size:12px;color:#94a3b8;">This code expires in 10 minutes.</p>
+      <p style="font-size:11px;color:#64748b;">If you didn't request this, you can safely ignore this email — your password won't change.</p>
+    </div>
+    """
+    return send_email(to_email, f"Your YobbyForex password reset code: {otp}", html)

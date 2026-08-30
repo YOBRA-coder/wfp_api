@@ -41,6 +41,7 @@ from pydantic import BaseModel
 
 from database import get_db
 from auth import get_current_user
+from push_send import notify_user
 
 MPESA_ENV       = os.getenv("MPESA_ENV", "sandbox")
 BASE_URL        = "https://sandbox.safaricom.co.ke" if MPESA_ENV == "sandbox" else "https://api.safaricom.co.ke"
@@ -57,10 +58,10 @@ REGISTRATION_FEE_KES = float(os.getenv("REGISTRATION_FEE_KES", "250"))
 USD_KES_RATE = float(os.getenv("USD_KES_RATE", "129"))
 MIN_WITHDRAWAL_USD = float(os.getenv("MIN_WITHDRAWAL_USD", "10"))
 SUBSCRIPTION_PRICES_KES = {
-    "trader_pro":     1200,
-    "trader_elite":   3500,
-    "provider_basic": 1200,
-    "provider_pro":   3500,
+    "trader_pro":     1,
+    "trader_elite":   3,
+    "provider_basic": 4,
+    "provider_pro":   5,
 }
 
 router = APIRouter(prefix="/payments/mpesa", tags=["mpesa"])
@@ -239,21 +240,17 @@ async def mpesa_callback(payload: dict):
                                (amount_usd, row["phone"], row["user_id"]))
                     db.execute("""UPDATE wallet_transactions SET status='completed', mpesa_receipt=?,
                                   processed_at=datetime('now') WHERE payment_id=?""", (receipt, row["id"]))
-                db.execute(
-                    "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
-                    (row["user_id"], "system", "Payment Successful ✅",
-                     f"Your M-Pesa payment of KES {row['amount']:.0f} was received. Receipt: {receipt or 'N/A'}")
-                )
+                notify_user(db, row["user_id"], "system", "Payment Successful ✅",
+                     f"Your M-Pesa payment of KES {row['amount']:.0f} was received. Receipt: {receipt or 'N/A'}",
+                     "/billing")
             else:
                 if row["kind"] == "wallet_deposit":
                     db.execute("""UPDATE wallet_transactions SET status='rejected',
                                   admin_note='M-Pesa payment cancelled/timed out', processed_at=datetime('now')
                                   WHERE payment_id=?""", (row["id"],))
-                db.execute(
-                    "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
-                    (row["user_id"], "system", "Payment Not Completed ⚠️",
-                     "Your M-Pesa payment was cancelled or timed out. You can try again anytime.")
-                )
+                notify_user(db, row["user_id"], "system", "Payment Not Completed ⚠️",
+                     "Your M-Pesa payment was cancelled or timed out. You can try again anytime.",
+                     "/billing")
     except Exception as e:
         print(f"[MPESA] callback error: {e}")
 

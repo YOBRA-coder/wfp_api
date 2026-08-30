@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV '/home/yobra/Desktop/Clients/new/Untitled Folder Real/yobbyforex/backend/.venv'
+set -gx VIRTUAL_ENV /home/yobra/Desktop/Clients/forex/yobbyforex/backend/.venv
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH

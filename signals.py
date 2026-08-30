@@ -4,7 +4,7 @@ Market Data Engine
 - Fallback: Realistic synthetic data (GBM + market cycles)
 - All technical indicators computed in-house (no external TA lib needed)
 """
-import math, hashlib, json
+import math, hashlib, json, threading
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -15,6 +15,7 @@ import urllib.request, urllib.error
 TWELVE_DATA_KEY = ""  # Optional: get free key at twelvedata.com for more calls
 
 PAIR_CONFIG = {
+    # ── Majors ──
     "EURUSD": (1.0850, 0.0050, 0.0001, 1.2, "EUR/USD"),
     "GBPUSD": (1.2700, 0.0080, 0.0001, 1.4, "GBP/USD"),
     "USDJPY": (149.50, 0.60,   0.01,   0.9, "USD/JPY"),
@@ -22,11 +23,40 @@ PAIR_CONFIG = {
     "USDCAD": (1.3600, 0.0045, 0.0001, 1.5, "USD/CAD"),
     "USDCHF": (0.8950, 0.0035, 0.0001, 1.4, "USD/CHF"),
     "NZDUSD": (0.6080, 0.0038, 0.0001, 1.6, "NZD/USD"),
+    # ── EUR crosses ──
     "EURGBP": (0.8550, 0.0030, 0.0001, 1.8, "EUR/GBP"),
     "EURJPY": (162.20, 0.75,   0.01,   1.1, "EUR/JPY"),
+    "EURAUD": (1.6580, 0.0090, 0.0001, 2.2, "EUR/AUD"),
+    "EURCAD": (1.4750, 0.0070, 0.0001, 2.0, "EUR/CAD"),
+    "EURCHF": (0.9710, 0.0035, 0.0001, 1.8, "EUR/CHF"),
+    "EURNZD": (1.7850, 0.0095, 0.0001, 2.5, "EUR/NZD"),
+    # ── GBP crosses ──
     "GBPJPY": (190.50, 1.20,   0.01,   1.3, "GBP/JPY"),
-    "XAUUSD": (2320.0, 8.0,    0.1,    3.0, "XAU/USD"),
-    "BTCUSD": (68000.0,1500.0, 1.0,   25.0, "BTC/USD"),
+    "GBPAUD": (1.9400, 0.0110, 0.0001, 2.6, "GBP/AUD"),
+    "GBPCAD": (1.7250, 0.0085, 0.0001, 2.4, "GBP/CAD"),
+    "GBPCHF": (1.1360, 0.0055, 0.0001, 2.2, "GBP/CHF"),
+    "GBPNZD": (2.0900, 0.0120, 0.0001, 2.8, "GBP/NZD"),
+    # ── AUD / NZD / CAD crosses ──
+    "AUDCAD": (0.8900, 0.0050, 0.0001, 2.0, "AUD/CAD"),
+    "AUDCHF": (0.5865, 0.0040, 0.0001, 2.0, "AUD/CHF"),
+    "AUDJPY": (97.90,  0.65,   0.01,   1.8, "AUD/JPY"),
+    "AUDNZD": (1.0770, 0.0050, 0.0001, 2.4, "AUD/NZD"),
+    "CADCHF": (0.6580, 0.0035, 0.0001, 2.2, "CAD/CHF"),
+    "CADJPY": (109.90, 0.60,   0.01,   1.9, "CAD/JPY"),
+    "CHFJPY": (166.90, 0.85,   0.01,   1.7, "CHF/JPY"),
+    "NZDCAD": (0.8280, 0.0050, 0.0001, 2.4, "NZD/CAD"),
+    "NZDCHF": (0.5445, 0.0040, 0.0001, 2.4, "NZD/CHF"),
+    "NZDJPY": (90.90,  0.60,   0.01,   2.0, "NZD/JPY"),
+    # ── Exotics ──
+    "USDSGD": (1.3350, 0.0040, 0.0001, 2.2,  "USD/SGD"),
+    "USDZAR": (17.85,  0.35,   0.0001, 15.0, "USD/ZAR"),
+    "USDMXN": (18.35,  0.30,   0.0001, 12.0, "USD/MXN"),
+    "USDTRY": (34.10,  0.60,   0.0001, 20.0, "USD/TRY"),
+    # ── Metals & crypto ──
+    "XAUUSD": (2320.0, 8.0,    0.1,    3.0,  "XAU/USD"),
+    "XAGUSD": (27.50,  0.60,   0.001,  3.5,  "XAG/USD"),
+    "BTCUSD": (68000.0,1500.0, 1.0,   25.0,  "BTC/USD"),
+    "ETHUSD": (3350.0, 120.0,  0.1,   20.0,  "ETH/USD"),
 }
 
 TF_MAP = {
@@ -100,14 +130,116 @@ def synthetic_ohlcv(pair: str, timeframe: str, n: int = 300, seed: int = None) -
     df = pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes}, index=times)
     return df
 
+
+# ── Market hours (used by the live synthetic fallback below) ──────────────────
+def is_market_closed(pair: str, dt: datetime) -> bool:
+    """Approximate forex/gold weekend closure: closed all day Saturday, and
+    Sunday until 22:00 UTC (roughly matches the real interbank session).
+    Crypto (BTCUSD) trades around the clock so it never counts as closed."""
+    if pair == "BTCUSD":
+        return False
+    wd = dt.weekday()  # Mon=0 .. Sun=6
+    if wd == 5:
+        return True
+    if wd == 6 and dt.hour < 22:
+        return True
+    return False
+
+def _last_open_time(pair: str, dt: datetime) -> datetime:
+    """If the market is closed at dt, roll back to the moment it closed
+    (Friday 22:00 UTC) so live candle generation freezes there instead of
+    minting new bars over the weekend."""
+    if not is_market_closed(pair, dt):
+        return dt
+    d = dt
+    for _ in range(3):
+        d = d - timedelta(days=1)
+        if d.weekday() == 4:
+            return d.replace(hour=22, minute=0, second=0, microsecond=0)
+    return dt
+
+def _floor_to_tf(dt: datetime, mins: int) -> datetime:
+    """Snap a timestamp down onto a clean timeframe boundary (e.g. M5 candles
+    open at :00/:05/:10..., not at whatever second the server happened to poll
+    at) — this is what keeps sub-1H candles from jittering."""
+    if mins >= 1440:
+        floored = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if mins >= 10080:
+            floored -= timedelta(days=floored.weekday())
+        return floored
+    total = dt.hour * 60 + dt.minute
+    f = (total // mins) * mins
+    return dt.replace(hour=f // 60, minute=f % 60, second=0, microsecond=0)
+
+# In-process cache of each pair/timeframe's evolving synthetic walk. Extended
+# bar-by-bar as real time passes (never re-randomized from scratch on every
+# poll — that was the source of the "sub-1H candles don't look right" and
+# "prices/chart don't agree" bugs), frozen exactly in place while the market
+# is closed, and resumed from that same price once it reopens.
+_SYNTH_LOCK = threading.Lock()
+_SYNTH_STATE: dict = {}  # (pair, timeframe) -> {"anchor": datetime, "closes": [...], "times": [...]}
+_SYNTH_KEEP = 900  # bars retained per (pair, timeframe) — plenty for any chart request
+
+def _walk_step(prev_close: float, base: float, tf_vol: float, idx: int, cyc_len: int, rng) -> float:
+    cyc = 0.35 * tf_vol * math.sin(2 * math.pi * idx / cyc_len)
+    rev = -0.04 * (prev_close - base) / base
+    shock = rng.normal(0, tf_vol)
+    ret = cyc / prev_close + rev + shock / prev_close
+    return prev_close * (1 + ret)
+
+def live_synthetic_ohlcv(pair: str, timeframe: str, n: int = 300, now: Optional[datetime] = None) -> pd.DataFrame:
+    """Stateful synthetic OHLCV for the live prices/chart endpoints (backtesting
+    keeps using the original stateless synthetic_ohlcv() — it wants a fresh,
+    fully-reproducible series for an arbitrary bar count, not a shared live walk)."""
+    base, daily_vol, pip, _, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
+    mins = TF_MAP.get(timeframe, ("", 60))[1]
+    tf_vol = daily_vol * math.sqrt(mins / 1440)
+    seed = int(hashlib.md5(f"{pair}{timeframe}".encode()).hexdigest(), 16) % (2**31)
+    rng = np.random.default_rng(seed)
+
+    raw_now = now or datetime.utcnow()
+    anchor = _floor_to_tf(_last_open_time(pair, raw_now), mins)
+    cyc_len = max(20, _SYNTH_KEEP // 6)
+    key = (pair, timeframe)
+
+    with _SYNTH_LOCK:
+        state = _SYNTH_STATE.get(key)
+        if state is None or state["anchor"] > anchor:
+            # First request for this pair/timeframe (or the clock moved
+            # backwards, e.g. a server restart) — bootstrap a fresh history
+            # ending exactly at `anchor`.
+            closes = [base]
+            for i in range(1, _SYNTH_KEEP):
+                closes.append(_walk_step(closes[-1], base, tf_vol, i, cyc_len, rng))
+            times = [anchor - timedelta(minutes=mins * (_SYNTH_KEEP - 1 - i)) for i in range(_SYNTH_KEEP)]
+            state = {"anchor": anchor, "closes": closes, "times": times}
+        elif state["anchor"] < anchor:
+            steps = int((anchor - state["anchor"]).total_seconds() // 60 // mins)
+            steps = min(max(steps, 0), 5000)  # guard against a huge catch-up after long downtime
+            closes, times = state["closes"], state["times"]
+            for i in range(steps):
+                closes.append(_walk_step(closes[-1], base, tf_vol, len(closes), cyc_len, rng))
+                times.append(times[-1] + timedelta(minutes=mins))
+            if len(closes) > _SYNTH_KEEP:
+                del closes[: len(closes) - _SYNTH_KEEP]
+                del times[: len(times) - _SYNTH_KEEP]
+            state["anchor"] = anchor
+        _SYNTH_STATE[key] = state
+        closes_arr = np.array(state["closes"][-n:], dtype=float)
+        times_out = list(state["times"][-n:])
+
+    opens = np.roll(closes_arr, 1); opens[0] = closes_arr[0]
+    highs = np.maximum(opens, closes_arr) + np.abs(rng.normal(0, tf_vol * 0.5, len(closes_arr)))
+    lows  = np.minimum(opens, closes_arr) - np.abs(rng.normal(0, tf_vol * 0.5, len(closes_arr)))
+    return pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes_arr}, index=times_out)
+
 def get_ohlcv(pair: str, timeframe: str, n: int = 200) -> pd.DataFrame:
-    """Get OHLCV — tries live first, falls back to synthetic"""
+    """Get OHLCV — tries live first, falls back to the stateful synthetic walk"""
     if timeframe in ("M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"):  # Live data available for these
         live = fetch_live_ohlcv(pair, timeframe, min(n, 500))
         if live is not None and len(live) >= 50:
             return live.tail(n)
-    return synthetic_ohlcv(pair, timeframe, n + 50,
-                           seed=int(datetime.now().strftime("%Y%m%d%H")))
+    return live_synthetic_ohlcv(pair, timeframe, n + 50)
 
 # ── Technical Indicators ──────────────────────────────────────────────────────
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
@@ -513,35 +645,43 @@ def get_live_quote(pair: str) -> dict:
             real_low   = float(data.get("low", real_price))
             real_chg   = float(data.get("change", 0.0))
             real_pct   = float(data.get("percent_change", 0.0))
+            # The upstream API only gives a single mid price — bid/ask/spread
+            # were previously hardcoded to price/price/0.0 here, which is why
+            # they looked broken (a real market never has a 0 spread). Derive
+            # a realistic bid/ask from the pair's configured spread instead,
+            # same as the synthetic fallback below already does.
+            _, _, real_pip, real_spread, _ = PAIR_CONFIG[pair]
             return {
                 "pair": pair, 
                 "price": round(real_price, 5),
-                "bid":  round(real_price, 5),  
-                "ask":  round(real_price, 5),  
+                "bid":  round(real_price - real_spread*real_pip/2, 5),
+                "ask":  round(real_price + real_spread*real_pip/2, 5),
                 "change": round(real_chg, 5), 
                 "change_pct": round(real_pct, 4),
                 "high": round(real_high, 5),
                 "low":  round(real_low, 5),
-                "spread": 0.0, 
+                "spread": real_spread, 
                 "source": "twelvedata",
                 "direction": "up" if real_chg >= 0 else "down"
             }    
     except: pass
-    
-    # Fallback
+
+    # Fallback — derived from the same live M1 synthetic walk used for charts,
+    # so the ticker price never disagrees with the last candle on screen, and
+    # freezes/resumes with it over weekends instead of drifting independently.
     base, vol, pip, spread, _ = PAIR_CONFIG[pair]
-    import random
-    rng = np.random.default_rng(int(datetime.now().strftime("%Y%m%d%H%M")) // 2 + abs(hash(pair)) % 9999)
-    price = base * (1 + rng.normal(0, vol/base*0.25))
-    chg   = rng.normal(0, vol*0.1)
+    df = live_synthetic_ohlcv(pair, "M1", 2)
+    price = float(df["close"].iloc[-1])
+    prev  = float(df["close"].iloc[-2]) if len(df) > 1 else price
+    chg   = price - prev
     return {
         "pair": pair, "price": round(price, 5),
         "bid":  round(price - spread*pip/2, 5),
         "ask":  round(price + spread*pip/2, 5),
         "change": round(chg, 5), "change_pct": round(chg/base*100, 4),
-        "high": round(price + abs(rng.normal(0,vol*0.4)),5),
-        "low":  round(price - abs(rng.normal(0,vol*0.4)),5),
-        "spread": spread, "direction": "up" if chg>=0 else "down",
+        "high": round(float(df["high"].iloc[-1]), 5),
+        "low":  round(float(df["low"].iloc[-1]), 5),
+        "spread": spread, "direction": "up" if chg >= 0 else "down",
         "source": "simulated", "timestamp": datetime.now().isoformat()
     }
 

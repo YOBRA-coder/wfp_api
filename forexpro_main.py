@@ -25,7 +25,8 @@ from signals import (get_ohlcv, add_indicators, build_signal, get_live_quote,
                      compute_risk_based_lot, _low_liquidity_window)
 from payments import router as payments_router
 from mpesa import router as mpesa_router
-from bridge import router as bridge_router
+from bridge import router as bridge_router, check_stale_bridges
+from prefs import router as prefs_router
 import pandas as pd
 import time
        
@@ -35,8 +36,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 from auth import create_token, decode_token, get_current_user, get_optional_user, security
 from telegram_send import send_telegram_message, generate_link_code, bot_deep_link, telegram_configured
-from push_send import send_push, push_configured, VAPID_PUBLIC_KEY
-from email_send import send_email, send_verification_email, email_configured
+from push_send import send_push, push_configured, VAPID_PUBLIC_KEY, push_to_user, notify_user
+from email_send import send_email, send_verification_email, send_password_reset_otp_email, email_configured
 import secrets
 
 # ── Pydantic Models ───────────────────────────────────────────────────────────
@@ -45,6 +46,12 @@ class RegisterReq(BaseModel):
 
 class LoginReq(BaseModel):
     email: str; password: str
+
+class ForgotPasswordReq(BaseModel):
+    email: str
+
+class ResetPasswordReq(BaseModel):
+    email: str; otp: str; new_password: str
 
 class GenerateSignalReq(BaseModel):
     pair: str = "EURUSD"; timeframe: str = "H1"
@@ -136,6 +143,7 @@ async def startup():
 app.include_router(payments_router)
 app.include_router(mpesa_router)
 app.include_router(bridge_router)
+app.include_router(prefs_router)
 # ── Auth Routes ───────────────────────────────────────────────────────────────
 @app.post("/auth/register")
 def register(req: RegisterReq):
@@ -183,8 +191,7 @@ def verify_email(token: str):
             return {"verified": False, "reason": "Link expired — request a new one from Settings"}
         db.execute("UPDATE users SET email_verified=1, email_verify_token=NULL, email_verify_expires=NULL WHERE id=?",
                    (row["id"],))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (row["id"], "system", "Email verified ✅", "Your email is confirmed."))
+        notify_user(db, row["id"], "system", "Email verified ✅", "Your email is confirmed.", "/settings")
     return {"verified": True}
 
 @app.post("/auth/accept-disclaimer")
@@ -212,6 +219,64 @@ def login(req: LoginReq):
             "subscription_expires_at": user["subscription_expires_at"],
             "subscription_active": is_subscription_active(dict(user)),
         }}
+
+@app.post("/auth/forgot-password")
+def forgot_password(req: ForgotPasswordReq):
+    """Always responds the same way whether or not the email exists — so this
+    endpoint can't be used to check which emails have accounts."""
+    with get_db() as db:
+        user = db.execute("SELECT id, username, password_reset_expires FROM users WHERE email=?",
+                           (req.email,)).fetchone()
+        if user:
+            # Throttle: don't re-send within 60s of the last code (still asked
+            # for again below), so a user mashing "resend" can't spam their inbox.
+            recently_sent = False
+            if user["password_reset_expires"]:
+                try:
+                    issued_at = datetime.fromisoformat(user["password_reset_expires"]) - timedelta(minutes=10)
+                    recently_sent = (datetime.now() - issued_at) < timedelta(seconds=60)
+                except Exception:
+                    recently_sent = False
+            if not recently_sent:
+                otp = f"{secrets.randbelow(1_000_000):06d}"
+                expires = (datetime.now() + timedelta(minutes=10)).isoformat()
+                db.execute("""UPDATE users SET password_reset_otp=?, password_reset_expires=?,
+                              password_reset_attempts=0 WHERE id=?""", (otp, expires, user["id"]))
+                if email_configured():
+                    send_password_reset_otp_email(req.email, user["username"], otp)
+    return {"sent": True}
+
+@app.post("/auth/reset-password")
+def reset_password(req: ResetPasswordReq):
+    if len(req.new_password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    with get_db() as db:
+        user = db.execute("SELECT * FROM users WHERE email=?", (req.email,)).fetchone()
+        if not user or not user["password_reset_otp"]:
+            raise HTTPException(400, "Invalid or expired code — request a new one")
+        if (user["password_reset_attempts"] or 0) >= 5:
+            raise HTTPException(400, "Too many incorrect attempts — request a new code")
+        try:
+            expired = datetime.fromisoformat(user["password_reset_expires"]) < datetime.now()
+        except Exception:
+            expired = True
+        if expired:
+            raise HTTPException(400, "This code has expired — request a new one")
+        if req.otp.strip() != user["password_reset_otp"]:
+            db.execute("UPDATE users SET password_reset_attempts = password_reset_attempts + 1 WHERE id=?",
+                       (user["id"],))
+            left = 5 - ((user["password_reset_attempts"] or 0) + 1)
+            db.commit()  # must persist before raising — get_db() rolls back on exception,
+                         # which was silently discarding this increment every time and
+                         # meant the 5-attempt lockout below never actually engaged
+            raise HTTPException(400, f"Incorrect code — {max(left, 0)} attempt(s) left")
+        db.execute("""UPDATE users SET password=?, password_reset_otp=NULL,
+                      password_reset_expires=NULL, password_reset_attempts=0 WHERE id=?""",
+                   (hash_password(req.new_password), user["id"]))
+        notify_user(db, user["id"], "system", "Password changed",
+                    "Your password was just reset. If this wasn't you, contact support immediately.", "/settings")
+        token = create_token(user["id"], user["username"])
+    return {"reset": True, "token": token}
 
 @app.get("/auth/me")
 def get_me(user=Depends(get_current_user)):
@@ -247,18 +312,16 @@ def _maybe_notify_subscription_expiry(db, user_row):
                               AND title LIKE 'Subscription expiring%'
                               AND created_at > datetime('now','-2 days')""", (uid,)).fetchone()
         if not dupe:
-            db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                (uid, "billing", "Subscription expiring soon",
+            notify_user(db, uid, "billing", "Subscription expiring soon",
                  f"Your {user_row['plan']} plan expires in {max(int(days_left),0)} day(s). "
-                 f"Renew in Billing to keep your current limits and features."))
+                 f"Renew in Billing to keep your current limits and features.", "/billing")
     elif days_left < 0:
         dupe = db.execute("""SELECT id FROM notifications WHERE user_id=? AND type='billing'
                               AND title = 'Subscription expired'
                               AND created_at > datetime('now','-2 days')""", (uid,)).fetchone()
         if not dupe:
-            db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                (uid, "billing", "Subscription expired",
-                 "Your plan has expired and your account reverted to Free-tier limits. Renew anytime in Billing."))
+            notify_user(db, uid, "billing", "Subscription expired",
+                 "Your plan has expired and your account reverted to Free-tier limits. Renew anytime in Billing.", "/billing")
 
 @app.put("/auth/profile")
 def update_profile(req: UpdateProfileReq, user=Depends(get_current_user)):
@@ -329,112 +392,172 @@ def generate_signal(req: GenerateSignalReq, user=Depends(get_current_user)):
     }
 
     with get_db() as db:
+        # Providers with active subscribers must confirm a signal before it
+        # reaches followers — generating one used to auto-copy it into real
+        # follower positions instantly, with no review step. A solo trader
+        # (no provider profile, or a provider with zero subscribers) has no
+        # one to distribute to anyway, so this only changes behavior for
+        # accounts that actually have followers riding on the call.
+        is_provider = db.execute("SELECT 1 FROM providers WHERE user_id=? AND is_active=1", (user["id"],)).fetchone()
+        sub_count = 0
+        if is_provider:
+            sub_count = db.execute("SELECT COUNT(*) c FROM subscriptions WHERE provider_id=? AND is_active=1",
+                                    (user["id"],)).fetchone()["c"]
+        approval_status = "pending_review" if (is_provider and sub_count > 0) else "approved"
+
         cur = db.execute("""
             INSERT INTO signals (provider_id,pair,timeframe,direction,strength,confidence,
             entry_price,stop_loss,take_profit,sl_pips,tp_pips,risk_reward,rsi,macd,
             ema20,ema50,bb_upper,bb_lower,stoch_k,atr,candle_pattern,chart_pattern,
-            entry_time,ai_analysis,expires_at,chart_data)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            entry_time,ai_analysis,expires_at,chart_data,approval_status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (user["id"], sig["pair"], sig["timeframe"], sig["direction"], sig["strength"],
               sig["confidence"], sig["entry_price"], sig["stop_loss"], sig["take_profit"],
               sig["sl_pips"], sig["tp_pips"], sig["risk_reward"], sig["rsi"], sig["macd"],
               sig["ema20"], sig["ema50"], sig["bb_upper"], sig["bb_lower"], sig["stoch_k"],
               sig["atr"], sig["candle_pattern"], sig["chart_pattern"], sig["entry_time"],
-              sig["ai_analysis"], sig["expires_at"], json.dumps(chart_data)))
+              sig["ai_analysis"], sig["expires_at"], json.dumps(chart_data), approval_status))
         sig_id = cur.lastrowid
-        
+
         # Distribute to subscribers — auto_copy=1 opens immediately (reserving margin),
         # auto_copy=0 creates a pending_approval row the follower must approve/decline
         # on the Copy Trading page (previously: nothing happened at all for manual
-        # subscribers, which is why "manual" looked broken).
+        # subscribers, which is why "manual" looked broken). Held back entirely if
+        # this signal still needs the provider's own approval (see above).
         provider_name = db.execute("SELECT username FROM users WHERE id=?", (user["id"],)).fetchone()["username"]
-        subs = db.execute(
-            """SELECT s.*, u.telegram_chat_id FROM subscriptions s
-               JOIN users u ON s.follower_id = u.id
-               WHERE s.provider_id=? AND s.is_active=1""",
-            (user["id"],)).fetchall()
         copies_created = 0
-        for sub in subs:
-            if sig["confidence"] < sub["min_confidence"]:
-                continue
-            pf = json.loads(sub["pairs_filter"] or "[]")
-            if pf and sig["pair"] not in pf:
-                continue
+        if approval_status == "approved":
+            copies_created = _distribute_signal_to_subscribers(db, sig_id, sig, user["id"], provider_name)
 
-            if not sub["auto_copy"]:
-                # Manual mode: suggest it, don't spend the follower's balance yet.
-                db.execute("""INSERT INTO copy_trades
-                    (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
-                     stop_loss,take_profit,status,execution_mode)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (sub["follower_id"], user["id"], sig_id, sub["max_lot"], sub["risk_pct"],
-                     sig["entry_price"], sig["stop_loss"], sig["take_profit"], "pending_approval", "simulated"))
-                db.execute("""INSERT INTO notifications (user_id,type,title,message)
-                    VALUES (?,?,?,?)""",
-                    (sub["follower_id"], "signal",
-                     f"Review to copy: {sig['pair']} {sig['direction']}",
-                     f"{sig['confidence']}% confidence — open Copy Trading to approve or decline."))
-                if sub["telegram_chat_id"]:
-                    send_telegram_message(sub["telegram_chat_id"],
-                        f"🔔 *{provider_name}* just posted a signal you're following (manual mode):\n\n"
-                        f"*{sig['pair']} {sig['direction']}* — {sig['confidence']}% confidence\n"
-                        f"Entry: `{sig['entry_price']}` · SL: `{sig['stop_loss']}` · TP: `{sig['take_profit']}`\n\n"
-                        f"Open Copy Trading in the app to approve or decline.")
-                push_to_user(db, sub["follower_id"], f"{provider_name}: {sig['pair']} {sig['direction']}",
-                             f"{sig['confidence']}% confidence — tap to review and approve", "/copy")
-                copies_created += 1
-                continue
-
-            live = False
-            if sub["auto_execute"]:
-                follower = db.execute("SELECT bridge_token FROM users WHERE id=?",
-                                       (sub["follower_id"],)).fetchone()
-                live = bool(follower and follower["bridge_token"])
-            exec_mode = "mt5" if live else "simulated"
-            status0   = "pending_bridge" if live else "open"
-            follower_bal = db.execute("SELECT balance FROM users WHERE id=?", (sub["follower_id"],)).fetchone()["balance"]
-            computed_lot = compute_risk_based_lot(follower_bal, sub["risk_pct"], sig["pair"], sig["sl_pips"], sub["max_lot"])
-            # MT5 trades don't touch the app's paper balance at all — the real
-            # margin is reserved by the broker on the actual MT5 account. Only
-            # simulated trades reserve margin here (previously both did, which
-            # meant a live trade wrongly deducted twice: once for real on the
-            # broker side, once again from the app balance).
-            margin = 0.0 if live else compute_margin_usd(sig["pair"], computed_lot)
-            if not live and follower_bal < margin:
-                db.execute("""INSERT INTO notifications (user_id,type,title,message)
-                    VALUES (?,?,?,?)""",
-                    (sub["follower_id"], "signal", f"Skipped {sig['pair']} — low balance",
-                     f"Needed ${margin:.2f} margin but balance is ${follower_bal:.2f}."))
-                continue
-            db.execute("""INSERT INTO copy_trades
-                (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
-                 stop_loss,take_profit,status,execution_mode,opened_at,margin_used)
-                VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),?)""",
-                (sub["follower_id"], user["id"], sig_id,
-                 computed_lot, sub["risk_pct"],
-                 sig["entry_price"], sig["stop_loss"], sig["take_profit"], status0, exec_mode, margin))
-            if margin:
-                db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, sub["follower_id"]))
-            copies_created += 1
-            db.execute("""INSERT INTO notifications (user_id,type,title,message)
-                VALUES (?,?,?,?)""",
-                (sub["follower_id"], "signal",
-                 f"Auto-copied: {sig['pair']} {sig['direction']}",
-                 f"Confidence: {sig['confidence']}% | Entry: {sig['entry_price']} | SL: {sig['stop_loss']} | TP: {sig['take_profit']}"))
-            if sub["telegram_chat_id"]:
-                send_telegram_message(sub["telegram_chat_id"],
-                    f"✅ Auto-copied *{provider_name}*'s signal:\n\n"
-                    f"*{sig['pair']} {sig['direction']}* — {sig['confidence']}% confidence\n"
-                    f"Entry: `{sig['entry_price']}` · SL: `{sig['stop_loss']}` · TP: `{sig['take_profit']}`\n"
-                    f"Lot: `{computed_lot}` ({'real MT5' if live else 'simulated'})")
-            push_to_user(db, sub["follower_id"], f"Auto-copied: {sig['pair']} {sig['direction']}",
-                         f"{provider_name} · {sig['confidence']}% confidence · lot {computed_lot}", "/copy")
-        
         sig["id"] = sig_id
+        sig["approval_status"] = approval_status
+        sig["needs_approval"] = approval_status == "pending_review"
         sig["copies_distributed"] = copies_created
         sig["ohlcv"] = ohlcv
-        broadcast_threadsafe("signals", {"type": "new_signal", "data": sig})
+        if approval_status == "approved":
+            broadcast_threadsafe("signals", {"type": "new_signal", "data": sig})
         return sig
+
+def _distribute_signal_to_subscribers(db, sig_id: int, sig: dict, provider_id: int, provider_name: str) -> int:
+    """Sends an approved signal to every active subscriber whose filters
+    match. Pulled out of /signals/generate so both the immediate path
+    (no-subscriber / non-provider fast path) and POST /signals/{id}/approve
+    (the gated provider path) share exactly one copy of this logic."""
+    subs = db.execute(
+        """SELECT s.*, u.telegram_chat_id FROM subscriptions s
+           JOIN users u ON s.follower_id = u.id
+           WHERE s.provider_id=? AND s.is_active=1""",
+        (provider_id,)).fetchall()
+    copies_created = 0
+    for sub in subs:
+        if sig["confidence"] < sub["min_confidence"]:
+            continue
+        pf = json.loads(sub["pairs_filter"] or "[]")
+        if pf and sig["pair"] not in pf:
+            continue
+
+        if not sub["auto_copy"]:
+            # Manual mode: suggest it, don't spend the follower's balance yet.
+            db.execute("""INSERT INTO copy_trades
+                (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
+                 stop_loss,take_profit,status,execution_mode)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (sub["follower_id"], provider_id, sig_id, sub["max_lot"], sub["risk_pct"],
+                 sig["entry_price"], sig["stop_loss"], sig["take_profit"], "pending_approval", "simulated"))
+            notify_user(db, sub["follower_id"], "signal",
+                 f"Review to copy: {sig['pair']} {sig['direction']}",
+                 f"{sig['confidence']}% confidence — open Copy Trading to approve or decline.", "/copy")
+            if sub["telegram_chat_id"]:
+                send_telegram_message(sub["telegram_chat_id"],
+                    f"🔔 *{provider_name}* just posted a signal you're following (manual mode):\n\n"
+                    f"*{sig['pair']} {sig['direction']}* — {sig['confidence']}% confidence\n"
+                    f"Entry: `{sig['entry_price']}` · SL: `{sig['stop_loss']}` · TP: `{sig['take_profit']}`\n\n"
+                    f"Open Copy Trading in the app to approve or decline.")
+            copies_created += 1
+            continue
+
+        live = False
+        if sub["auto_execute"]:
+            follower = db.execute("SELECT bridge_token FROM users WHERE id=?",
+                                   (sub["follower_id"],)).fetchone()
+            live = bool(follower and follower["bridge_token"])
+        exec_mode = "mt5" if live else "simulated"
+        status0   = "pending_bridge" if live else "open"
+        follower_bal = db.execute("SELECT balance FROM users WHERE id=?", (sub["follower_id"],)).fetchone()["balance"]
+        computed_lot = compute_risk_based_lot(follower_bal, sub["risk_pct"], sig["pair"], sig["sl_pips"], sub["max_lot"])
+        # MT5 trades don't touch the app's paper balance at all — the real
+        # margin is reserved by the broker on the actual MT5 account. Only
+        # simulated trades reserve margin here (previously both did, which
+        # meant a live trade wrongly deducted twice: once for real on the
+        # broker side, once again from the app balance).
+        margin = 0.0 if live else compute_margin_usd(sig["pair"], computed_lot)
+        if not live and follower_bal < margin:
+            notify_user(db, sub["follower_id"], "signal", f"Skipped {sig['pair']} — low balance",
+                 f"Needed ${margin:.2f} margin but balance is ${follower_bal:.2f}.", "/copy")
+            continue
+        db.execute("""INSERT INTO copy_trades
+            (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
+             stop_loss,take_profit,status,execution_mode,opened_at,margin_used)
+            VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),?)""",
+            (sub["follower_id"], provider_id, sig_id,
+             computed_lot, sub["risk_pct"],
+             sig["entry_price"], sig["stop_loss"], sig["take_profit"], status0, exec_mode, margin))
+        if margin:
+            db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, sub["follower_id"]))
+        copies_created += 1
+        notify_user(db, sub["follower_id"], "signal",
+             f"Auto-copied: {sig['pair']} {sig['direction']}",
+             f"Confidence: {sig['confidence']}% | Entry: {sig['entry_price']} | SL: {sig['stop_loss']} | TP: {sig['take_profit']}", "/copy")
+        if sub["telegram_chat_id"]:
+            send_telegram_message(sub["telegram_chat_id"],
+                f"✅ Auto-copied *{provider_name}*'s signal:\n\n"
+                f"*{sig['pair']} {sig['direction']}* — {sig['confidence']}% confidence\n"
+                f"Entry: `{sig['entry_price']}` · SL: `{sig['stop_loss']}` · TP: `{sig['take_profit']}`\n"
+                f"Lot: `{computed_lot}` ({'real MT5' if live else 'simulated'})")
+    return copies_created
+
+@app.get("/signals/pending-review")
+def pending_review_signals(user=Depends(get_current_user)):
+    """A provider's own AI-generated signals still awaiting their confirm/reject
+    before followers see them. Not the same as a follower's own
+    pending_approval copy_trades (Copy Trading page) — this is the provider-
+    side gate that happens first."""
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT * FROM signals WHERE provider_id=? AND approval_status='pending_review'
+            ORDER BY created_at DESC
+        """, (user["id"],)).fetchall()
+        return {"signals": [_expand_signal(dict(r)) for r in rows]}
+
+@app.post("/signals/{signal_id}/approve")
+def approve_signal(signal_id: int, user=Depends(get_current_user)):
+    """Confirms an AI-generated signal was reviewed and should go out to
+    followers now — the step that was missing before (generating used to
+    mean instantly copied, with no chance to review it first)."""
+    with get_db() as db:
+        sig_row = db.execute("SELECT * FROM signals WHERE id=? AND provider_id=?", (signal_id, user["id"])).fetchone()
+        if not sig_row:
+            raise HTTPException(404, "Signal not found")
+        if sig_row["approval_status"] != "pending_review":
+            raise HTTPException(400, f"This signal is already {sig_row['approval_status']}")
+        db.execute("UPDATE signals SET approval_status='approved' WHERE id=?", (signal_id,))
+        provider_name = db.execute("SELECT username FROM users WHERE id=?", (user["id"],)).fetchone()["username"]
+        copies_created = _distribute_signal_to_subscribers(db, signal_id, dict(sig_row), user["id"], provider_name)
+        broadcast_threadsafe("signals", {"type": "new_signal", "data": _expand_signal(dict(sig_row))})
+        return {"approved": True, "copies_distributed": copies_created}
+
+@app.post("/signals/{signal_id}/reject")
+def reject_signal(signal_id: int, user=Depends(get_current_user)):
+    """Discards a generated signal before it ever reaches followers — no
+    copy_trades are created, nobody gets notified."""
+    with get_db() as db:
+        sig_row = db.execute("SELECT * FROM signals WHERE id=? AND provider_id=?", (signal_id, user["id"])).fetchone()
+        if not sig_row:
+            raise HTTPException(404, "Signal not found")
+        if sig_row["approval_status"] != "pending_review":
+            raise HTTPException(400, f"This signal is already {sig_row['approval_status']}")
+        db.execute("UPDATE signals SET approval_status='rejected', status='cancelled' WHERE id=?", (signal_id,))
+        return {"rejected": True}
 
 @app.post("/signals/manual")
 def create_manual_signal(req: ManualSignalReq, user=Depends(get_current_user)):
@@ -549,9 +672,8 @@ def _activate_manual_signal(db, provider_id: int, sig_id: int, req_or_row, prow)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (sub["follower_id"], provider_id, sig_id, sub["max_lot"], sub["risk_pct"],
                      entry, stop, target, "pending_approval", "simulated", pair, direction, master_trade_id))
-                db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                    (sub["follower_id"], "signal", f"Review to copy: {pair} {direction}",
-                     f"{provider_name} is running this trade live — open Copy Trading to approve or decline."))
+                notify_user(db, sub["follower_id"], "signal", f"Review to copy: {pair} {direction}",
+                     f"{provider_name} is running this trade live — open Copy Trading to approve or decline.", "/copy")
                 copies_created += 1
                 continue
 
@@ -570,11 +692,8 @@ def _activate_manual_signal(db, provider_id: int, sig_id: int, req_or_row, prow)
             if f_margin:
                 db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (f_margin, sub["follower_id"]))
             copies_created += 1
-            db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                (sub["follower_id"], "signal", f"Auto-copied: {pair} {direction}",
-                 f"{provider_name} opened this live — lot {f_lot} ({'real MT5' if f_live else 'simulated'})"))
-            push_to_user(db, sub["follower_id"], f"Auto-copied: {pair} {direction}",
-                         f"{provider_name} · lot {f_lot}", "/copy")
+            notify_user(db, sub["follower_id"], "signal", f"Auto-copied: {pair} {direction}",
+                 f"{provider_name} opened this live — lot {f_lot} ({'real MT5' if f_live else 'simulated'})", "/copy")
             if sub["telegram_chat_id"]:
                 send_telegram_message(sub["telegram_chat_id"],
                     f"✅ *{provider_name}* opened *{pair} {direction}* live — auto-copied for you (lot {f_lot}).")
@@ -662,14 +781,14 @@ def latest_signals(limit: int = Query(20), user=Depends(get_optional_user)):
             rows = db.execute("""
                 SELECT s.*, u.username as provider_name
                 FROM signals s LEFT JOIN users u ON s.provider_id=u.id
-                WHERE s.status='active' AND s.created_at <= datetime('now', ?)
+                WHERE s.status='active' AND s.approval_status != 'pending_review' AND s.created_at <= datetime('now', ?)
                 ORDER BY s.created_at DESC LIMIT ?
             """, (f'-{delay} minutes', limit)).fetchall()
         else:
             rows = db.execute("""
                 SELECT s.*, u.username as provider_name
                 FROM signals s LEFT JOIN users u ON s.provider_id=u.id
-                WHERE s.status='active'
+                WHERE s.status='active' AND s.approval_status != 'pending_review'
                 ORDER BY s.created_at DESC LIMIT ?
             """, (limit,)).fetchall()
         # Let the free-tier UI show "N real-time signals available on Pro" rather
@@ -691,6 +810,7 @@ def backtest_signal_engine(pair: str = "EURUSD", timeframe: str = "H1", bars: in
     return run_backtest(pair, timeframe, bars)
 
 
+@app.get("/signals/history")
 def signal_history(pair: str = "EURUSD", timeframe: str = "H1", period: str = "1M",
                    user=Depends(get_optional_user)):
     n = {"1M":180,"3M":360,"6M":540,"1Y":720}.get(period, 180)
@@ -814,9 +934,8 @@ def remove_follower(follower_id: int, user=Depends(get_current_user)):
             raise HTTPException(404, "This user isn't following you")
         db.execute("UPDATE subscriptions SET is_active=0 WHERE id=?", (sub["id"],))
         db.execute("UPDATE providers SET followers_count = MAX(0, followers_count-1) WHERE user_id=?", (user["id"],))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-            (follower_id, "copy", "Subscription ended",
-             "The provider you were following removed you as a subscriber — new signals from them will stop."))
+        notify_user(db, follower_id, "copy", "Subscription ended",
+             "The provider you were following removed you as a subscriber — new signals from them will stop.", "/providers")
         return {"removed": True}
 
 @app.get("/providers/me/earnings")
@@ -892,6 +1011,10 @@ def copy_signal_manually(signal_id: int, req: CopySignalReq, user=Depends(get_cu
             raise HTTPException(400, "You can't copy your own signal")
         if sig["status"] != "active":
             raise HTTPException(400, "This signal has already closed")
+        if sig["approval_status"] == "pending_review":
+            raise HTTPException(400, "This signal is still awaiting the provider's confirmation")
+        if sig["approval_status"] == "rejected":
+            raise HTTPException(400, "This signal was withdrawn by its provider")
         dup = db.execute(
             "SELECT id FROM copy_trades WHERE follower_id=? AND signal_id=?",
             (user["id"], signal_id)).fetchone()
@@ -1150,8 +1273,7 @@ def subscribe(req: SubscribeReq, user=Depends(get_current_user)):
         
         mode_msg = "You are now copying trades automatically." if req.auto_copy else \
                    "Manual mode — you'll get a notification to review and approve each signal before it opens."
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (user["id"], "copy", "Copy Trading Activated", mode_msg))
+        notify_user(db, user["id"], "copy", "Copy Trading Activated", mode_msg, "/copy")
         return {"success": True, "message": mode_msg}
 
 @app.delete("/copy/unsubscribe/{provider_id}")
@@ -1239,6 +1361,27 @@ def update_subscription(provider_id: int, req: SubscribeReq, user=Depends(get_cu
         return {"success": True}
 
 # ── Prices ────────────────────────────────────────────────────────────────────
+@app.get("/prices/pairs")
+def list_pairs():
+    """Every pair the platform can price/chart/generate signals for — the
+    frontend's pair search/picker pulls this instead of hardcoding a list,
+    so adding a pair here is the only place it needs to be added."""
+    groups = {
+        "Majors":  ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"],
+        "EUR crosses": ["EURGBP","EURJPY","EURAUD","EURCAD","EURCHF","EURNZD"],
+        "GBP crosses": ["GBPJPY","GBPAUD","GBPCAD","GBPCHF","GBPNZD"],
+        "Other crosses": ["AUDCAD","AUDCHF","AUDJPY","AUDNZD","CADCHF","CADJPY","CHFJPY","NZDCAD","NZDCHF","NZDJPY"],
+        "Exotics": ["USDSGD","USDZAR","USDMXN","USDTRY"],
+        "Metals & Crypto": ["XAUUSD","XAGUSD","BTCUSD","ETHUSD"],
+    }
+    return {
+        "pairs": [
+            {"symbol": p, "display": PAIR_CONFIG[p][4], "group": g}
+            for g, syms in groups.items() for p in syms if p in PAIR_CONFIG
+        ],
+        "groups": list(groups.keys()),
+    }
+
 @app.get("/prices/live")
 def live_prices(pairs: str = Query("EURUSD,GBPUSD,USDJPY,AUDUSD,XAUUSD,BTCUSD")):
     pair_list = [p.strip() for p in pairs.split(",") if p.strip() in PAIR_CONFIG]
@@ -1291,8 +1434,13 @@ def list_courses(user=Depends(get_optional_user)):
                 cd["progress"] = dict(prog) if prog else {"lesson_idx":0,"completed":0,"score":0}
             # Count lessons
             full = db.execute("SELECT lessons FROM education_courses WHERE id=?", (c["id"],)).fetchone()
-            try: cd["lesson_count"] = len(json.loads(full["lessons"]))
-            except: cd["lesson_count"] = 0
+            try:
+                parsed = json.loads(full["lessons"])
+                cd["lesson_count"] = len(parsed)
+                cd["total_duration"] = sum(int(l.get("duration") or 0) for l in parsed)
+            except Exception:
+                cd["lesson_count"] = 0
+                cd["total_duration"] = 0
             result.append(cd)
         return {"courses": result}
 
@@ -1324,9 +1472,8 @@ def update_progress(req: UpdateProgressReq, user=Depends(get_current_user)):
                           VALUES (?,?,?,?,?)""",
                        (user["id"], req.course_id, req.lesson_idx, int(req.completed), req.score))
         if req.completed:
-            db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                       (user["id"], "education", "Course Completed!",
-                        f"You completed a course with score {req.score}%!"))
+            notify_user(db, user["id"], "education", "Course Completed!",
+                        f"You completed a course with score {req.score}%!", "/education")
         return {"success": True}
 
 @app.get("/education/my-progress")
@@ -1355,11 +1502,30 @@ def add_journal(req: JournalEntryReq, user=Depends(get_current_user)):
 
 @app.get("/journal")
 def get_journal(user=Depends(get_current_user)):
+    """Combines the trader's own manual entries with their closed copy trades —
+    previously these were two disconnected things: Copy Trading kept showing
+    closed/failed trades forever (cluttering the "what's still open" view),
+    while Journal only ever showed what someone typed in by hand and never
+    picked up a closed copy trade at all. Now closed copy trades land here
+    automatically, same as a manual entry would, tagged source='copy' so the
+    UI can badge them differently."""
     with get_db() as db:
-        rows = db.execute(
+        manual_rows = db.execute(
             "SELECT * FROM trade_journal WHERE user_id=? ORDER BY traded_at DESC LIMIT 100",
             (user["id"],)).fetchall()
-        trades = [dict(r) for r in rows]
+        manual = [{**dict(r), "source": "manual"} for r in manual_rows]
+
+        copy_rows = db.execute("""
+            SELECT ct.id, ct.pair, ct.direction, ct.entry_price, ct.close_price as exit_price,
+                   ct.lot_size, ct.pnl_usd, ct.pnl_pips, ct.closed_at as traded_at, ct.status,
+                   ct.execution_mode, ct.fail_reason, u.username as provider_name
+            FROM copy_trades ct LEFT JOIN users u ON ct.provider_id = u.id
+            WHERE ct.follower_id=? AND ct.status IN ('closed','failed')
+            ORDER BY ct.closed_at DESC LIMIT 100
+        """, (user["id"],)).fetchall()
+        copy = [{**dict(r), "source": "copy", "notes": None, "emotion": None, "setup": None} for r in copy_rows]
+
+        trades = sorted(manual + copy, key=lambda t: t.get("traded_at") or "", reverse=True)[:150]
         total_pnl = sum(t["pnl_usd"] or 0 for t in trades)
         wins = sum(1 for t in trades if (t["pnl_usd"] or 0) > 0)
         best = max((t["pnl_usd"] or 0 for t in trades), default=0)
@@ -1409,9 +1575,8 @@ def telegram_link_confirm(req: TelegramLinkConfirmReq):
         db.execute("""UPDATE users SET telegram_chat_id=?, telegram_username=?,
                       telegram_link_code=NULL, telegram_link_expires=NULL WHERE id=?""",
                    (req.chat_id, req.username, row["id"]))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (row["id"], "system", "Telegram connected ✅",
-                    "You'll now get a Telegram message whenever a provider you follow posts a new signal."))
+        notify_user(db, row["id"], "system", "Telegram connected ✅",
+                    "You'll now get a Telegram message whenever a provider you follow posts a new signal.", "/settings")
     return {"linked": True}
 
 @app.get("/telegram/status")
@@ -1455,19 +1620,9 @@ def push_unsubscribe(endpoint: str, user=Depends(get_current_user)):
         db.execute("DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?", (endpoint, user["id"]))
     return {"unsubscribed": True}
 
-def push_to_user(db, user_id: int, title: str, body: str, url: str = "/"):
-    """Push to every device/browser this user has installed the PWA on. Dead
-    subscriptions (expired/uninstalled) get cleaned up automatically."""
-    if not push_configured():
-        return
-    subs = db.execute("SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id=?",
-                       (user_id,)).fetchall()
-    for s in subs:
-        ok = send_push(
-            {"endpoint": s["endpoint"], "keys": {"p256dh": s["p256dh"], "auth": s["auth"]}},
-            title, body, url)
-        if not ok:
-            db.execute("DELETE FROM push_subscriptions WHERE id=?", (s["id"],))
+# push_to_user / notify_user now live in push_send.py — shared with
+# mpesa.py, bridge.py, and payments.py so every event (not just the ones in
+# this file) can fire a real push, not just an in-app notification row.
 
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
@@ -1582,10 +1737,9 @@ def request_withdrawal(req: WithdrawReq, user=Depends(get_current_user)):
             (user_id, type, amount_usd, method, status, phone)
             VALUES (?,'withdrawal',?,'mpesa','pending',?)""",
             (user["id"], req.amount_usd, req.phone))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-            (user["id"], "billing", "Withdrawal requested",
+        notify_user(db, user["id"], "billing", "Withdrawal requested",
              f"${req.amount_usd:.2f} reserved and queued for payout to {req.phone}. "
-             f"This is processed manually — you'll get a notification once it's sent."))
+             f"This is processed manually — you'll get a notification once it's sent.", "/wallet")
         return {"requested": True, "transaction_id": cur.lastrowid}
 
 @app.post("/wallet/withdrawals/{tx_id}/approve")
@@ -1598,10 +1752,9 @@ def approve_withdrawal(tx_id: int, mpesa_receipt: str = "", user=Depends(get_cur
         if not tx: raise HTTPException(404, "Pending withdrawal not found")
         db.execute("""UPDATE wallet_transactions SET status='completed', mpesa_receipt=?,
                       processed_at=datetime('now') WHERE id=?""", (mpesa_receipt, tx_id))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-            (tx["user_id"], "billing", "Withdrawal sent ✅",
+        notify_user(db, tx["user_id"], "billing", "Withdrawal sent ✅",
              f"${tx['amount_usd']:.2f} has been sent to {tx['phone']}." +
-             (f" M-Pesa ref: {mpesa_receipt}" if mpesa_receipt else "")))
+             (f" M-Pesa ref: {mpesa_receipt}" if mpesa_receipt else ""), "/wallet")
         return {"approved": True}
 
 @app.post("/wallet/withdrawals/{tx_id}/reject")
@@ -1615,9 +1768,8 @@ def reject_withdrawal(tx_id: int, reason: str = "", user=Depends(get_current_use
         db.execute("""UPDATE wallet_transactions SET status='rejected', admin_note=?,
                       processed_at=datetime('now') WHERE id=?""", (reason, tx_id))
         db.execute("UPDATE users SET balance = balance + ? WHERE id=?", (tx["amount_usd"], tx["user_id"]))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-            (tx["user_id"], "billing", "Withdrawal declined",
-             f"${tx['amount_usd']:.2f} was returned to your balance. Reason: {reason or 'Not specified'}"))
+        notify_user(db, tx["user_id"], "billing", "Withdrawal declined",
+             f"${tx['amount_usd']:.2f} was returned to your balance. Reason: {reason or 'Not specified'}", "/wallet")
         return {"rejected": True}
 
 @app.get("/notifications")
@@ -1695,13 +1847,19 @@ MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 class ConnectionManager:
     def __init__(self):
         self.channels: dict[str, set] = {"prices": set(), "signals": set(), "candles": set()}
+        # Per-connection pair subscription for the "prices" channel — see
+        # price_broadcaster_loop for why this replaced a single shared broadcast.
+        self.price_pairs: dict = {}
 
-    async def connect(self, channel: str, ws: WebSocket):
+    async def connect(self, channel: str, ws: WebSocket, pairs: list = None):
         await ws.accept()
         self.channels.setdefault(channel, set()).add(ws)
+        if channel == "prices" and pairs:
+            self.price_pairs[ws] = pairs
 
     def disconnect(self, channel: str, ws: WebSocket):
         self.channels.get(channel, set()).discard(ws)
+        self.price_pairs.pop(ws, None)
 
     async def broadcast(self, channel: str, message: dict):
         dead = []
@@ -1727,21 +1885,43 @@ def broadcast_threadsafe(channel: str, message: dict):
 DEFAULT_TICK_PAIRS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","XAUUSD","BTCUSD"]
 
 async def price_broadcaster_loop():
-    """Background task: pushes fresh quotes to all /ws/prices subscribers every ~1.5s."""
+    """Background task: pushes fresh quotes to /ws/prices subscribers every ~1.5s.
+    Each connection gets only the pairs it actually asked for via ?pairs= — this
+    used to broadcast one fixed 9-pair list to every connection regardless of what
+    was requested, so any watchlist pair outside that fixed set (most of the 36
+    pairs the platform supports) never received a live tick over the socket at
+    all, even though /prices/live (the REST endpoint) worked fine for them."""
     while True:
         try:
-            if manager.channels.get("prices"):
-                prices = [get_live_quote(p) for p in DEFAULT_TICK_PAIRS]
-                await manager.broadcast("prices", {
-                    "type": "prices", "data": prices, "ts": datetime.now().isoformat()
-                })
+            conns = list(manager.channels.get("prices", set()))
+            if conns:
+                needed = set()
+                for ws in conns:
+                    needed.update(manager.price_pairs.get(ws) or DEFAULT_TICK_PAIRS)
+                # Fetch each unique pair once and share it across every connection
+                # asking for it, rather than re-fetching per connection.
+                quote_cache = {p: get_live_quote(p) for p in needed}
+                ts = datetime.now().isoformat()
+                dead = []
+                for ws in conns:
+                    pair_list = manager.price_pairs.get(ws) or DEFAULT_TICK_PAIRS
+                    payload = {"type": "prices",
+                               "data": [quote_cache[p] for p in pair_list if p in quote_cache],
+                               "ts": ts}
+                    try:
+                        await ws.send_json(payload)
+                    except Exception:
+                        dead.append(ws)
+                for ws in dead:
+                    manager.disconnect("prices", ws)
         except Exception as e:
             print(f"[WS] price loop error: {e}")
         await asyncio.sleep(1.5)
 
 @app.websocket("/ws/prices")
 async def ws_prices(websocket: WebSocket, pairs: str = Query(None)):
-    await manager.connect("prices", websocket)
+    pair_list = [p.strip() for p in (pairs or "").split(",") if p.strip() in PAIR_CONFIG] or None
+    await manager.connect("prices", websocket, pairs=pair_list)
     try:
         while True:
             await websocket.receive_text()  # keepalive / ignored pings from client
@@ -1893,9 +2073,8 @@ def check_pending_triggers():
                     continue
                 db.execute("UPDATE signals SET status='active', entry_price=? WHERE id=?", (price, sig["id"]))
                 _activate_manual_signal(db, sig["provider_id"], sig["id"], sig, prow)
-                db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                    (sig["provider_id"], "signal", f"Pending signal triggered: {sig['pair']}",
-                     f"Price hit your trigger ({trigger}) — trade opened at {price}."))
+                notify_user(db, sig["provider_id"], "signal", f"Pending signal triggered: {sig['pair']}",
+                     f"Price hit your trigger ({trigger}) — trade opened at {price}.", "/signals")
             except Exception as e:
                 print(f"[PendingTrigger] error on signal {sig['id']}: {e}")
 
@@ -1903,6 +2082,7 @@ def settle_once():
     """One settlement pass — pulled out of the loop so it can be unit-tested directly."""
     check_pending_triggers()
     with get_db() as db:
+        check_stale_bridges(db)
         active = db.execute("SELECT * FROM signals WHERE status='active'").fetchall()
         for sig in active:
             try:
@@ -1943,13 +2123,9 @@ def settle_once():
                 pnl_usd = pip_value_usd(sig["pair"], pnl_pips, t["lot_size"])
                 apply_trade_close(db, t["id"], close_price, pnl_pips, pnl_usd, result,
                                     "Auto-closed on TP/SL")
-                db.execute("""INSERT INTO notifications (user_id,type,title,message)
-                              VALUES (?,?,?,?)""",
-                           (t["follower_id"], "trade_closed",
-                            f"{sig['pair']} {result.upper()}",
-                            f"Closed at {close_price} · {pnl_pips:+.1f} pips · ${pnl_usd:+.2f}"))
-                push_to_user(db, t["follower_id"], f"{sig['pair']} {result.upper()}",
-                             f"Closed at {close_price} · {pnl_pips:+.1f} pips · ${pnl_usd:+.2f}", "/copy")
+                notify_user(db, t["follower_id"], "trade_closed",
+                     f"{sig['pair']} {result.upper()}",
+                     f"Closed at {close_price} · {pnl_pips:+.1f} pips · ${pnl_usd:+.2f}", "/copy")
 
             if sig["provider_id"]:
                 recompute_provider_stats(db, sig["provider_id"])
