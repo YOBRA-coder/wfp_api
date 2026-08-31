@@ -4,7 +4,7 @@ Market Data Engine
 - Fallback: Realistic synthetic data (GBM + market cycles)
 - All technical indicators computed in-house (no external TA lib needed)
 """
-import math, hashlib, json, threading
+import math, hashlib, json, threading, time
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -70,6 +70,20 @@ TF_MAP = {
     "W1":  ("1week",10080),
 }
 
+def to_unix_utc(ts) -> int:
+    """Convert any timestamp (naive or tz-aware) to a UTC unix second count.
+    pandas/py datetime .timestamp() silently treats a naive datetime as the
+    *server's local time*, not UTC — on a server that isn't running in UTC
+    that quietly shifts every chart timestamp, which is what made the x-axis
+    (and its EAT conversion) land on the wrong hour. Always localize/convert
+    through UTC explicitly instead of relying on the ambient server timezone."""
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    else:
+        t = t.tz_convert("UTC")
+    return int(t.timestamp())
+
 def fetch_live_ohlcv(pair: str, timeframe: str, outputsize: int = 150) -> Optional[pd.DataFrame]:
     """Fetch real OHLCV data from Twelve Data API"""
     try:
@@ -77,9 +91,12 @@ def fetch_live_ohlcv(pair: str, timeframe: str, outputsize: int = 150) -> Option
         symbol = PAIR_CONFIG[pair][4].replace("/", "")  # EURUSD format
         
         key_param = f"&apikey={TWELVE_DATA_KEY}" if TWELVE_DATA_KEY else "&apikey=demo"
+        # timezone=UTC is required — without it Twelve Data returns forex bars
+        # in the exchange's local time (US/Eastern), which silently shifted
+        # every candle by several hours once we converted "as UTC" downstream.
         url = (f"https://api.twelvedata.com/time_series?"
                f"symbol={PAIR_CONFIG[pair][4]}&interval={tf_api}"
-               f"&outputsize={outputsize}&format=JSON{key_param}")
+               f"&outputsize={outputsize}&timezone=UTC&format=JSON{key_param}")
         
         req = urllib.request.Request(url, headers={"User-Agent": "ForexPro/1.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -95,6 +112,17 @@ def fetch_live_ohlcv(pair: str, timeframe: str, outputsize: int = 150) -> Option
             df[col] = df[col].astype(float)
         df = df.sort_values("time").reset_index(drop=True)
         df.index = pd.to_datetime(df["time"])
+
+        # Drop weekend / market-closed bars. The upstream feed sometimes
+        # backfills the Sat/Sun gap with flat, zero-range candles (open ==
+        # high == low == close, repeated) instead of simply omitting them —
+        # left in, those flatline stretches drag EMA/BB toward a flat price,
+        # zero out ATR, and send RSI/ADX to degenerate values right before
+        # the Monday open, corrupting every indicator derived from them.
+        closed_mask = df.index.to_series().apply(lambda ts: is_market_closed(pair, ts.to_pydatetime()))
+        flat_mask = (df["open"] == df["high"]) & (df["high"] == df["low"]) & (df["low"] == df["close"])
+        df = df[~(closed_mask & flat_mask) & ~closed_mask]
+
         return df[["open","high","low","close"]]
     except Exception as e:
         return None
@@ -632,10 +660,38 @@ def compute_risk_based_lot(balance: float, risk_pct: float, pair: str, sl_pips: 
     lot = max(0.01, min(lot, max_lot))
     return round(lot, 2)
 
+_QUOTE_CACHE: dict = {}       # pair -> (monotonic_ts, quote_dict)
+_QUOTE_CACHE_LOCK = threading.Lock()
+_QUOTE_CACHE_TTL = 4.0        # seconds
+
 def get_live_quote(pair: str) -> dict:
-    """Get single live price quote"""
+    """Get single live price quote, throttled through a short-TTL cache.
+
+    /ws/prices polls every ~1.5s for every pair on a client's watchlist, and
+    every open ws/candles connection polls again every 2s — with a few pairs
+    and a few connected clients that's dozens of upstream calls a minute
+    against Twelve Data's tightly rate-limited demo key. Once that limit was
+    hit this silently fell into the except-fallback below on every other
+    call, so the UI flipped between a real quote and an unrelated synthetic
+    one from one tick to the next — which is what looked like prices
+    'appearing and disappearing'. Caching each pair's quote for a few
+    seconds keeps the upstream call volume sane and gives every subscriber
+    (across pairs, connections and endpoints) the same figure at once."""
+    now = time.monotonic()
+    with _QUOTE_CACHE_LOCK:
+        cached = _QUOTE_CACHE.get(pair)
+        if cached and (now - cached[0]) < _QUOTE_CACHE_TTL:
+            return cached[1]
+    quote = _fetch_live_quote(pair)
+    with _QUOTE_CACHE_LOCK:
+        _QUOTE_CACHE[pair] = (now, quote)
+    return quote
+
+def _fetch_live_quote(pair: str) -> dict:
+    """Uncached single live price quote — see get_live_quote() for throttling."""
     try:
-        url = f"https://api.twelvedata.com/price?symbol={PAIR_CONFIG[pair][4]}&apikey=demo"
+        key_param = TWELVE_DATA_KEY if TWELVE_DATA_KEY else "demo"
+        url = f"https://api.twelvedata.com/price?symbol={PAIR_CONFIG[pair][4]}&apikey={key_param}"
         req = urllib.request.Request(url, headers={"User-Agent": "ForexPro/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())

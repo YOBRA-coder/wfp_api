@@ -22,7 +22,7 @@ from database import get_db, init_db, hash_password, verify_password, is_subscri
 from signals import (get_ohlcv, add_indicators, build_signal, get_live_quote,
                      PAIR_CONFIG, TF_MAP, detect_support_resistance,
                      detect_trendline, build_markers, pip_value_usd, compute_margin_usd, run_backtest,
-                     compute_risk_based_lot, _low_liquidity_window)
+                     compute_risk_based_lot, _low_liquidity_window, to_unix_utc)
 from payments import router as payments_router
 from mpesa import router as mpesa_router
 from bridge import router as bridge_router, check_stale_bridges
@@ -1403,7 +1403,7 @@ def price_chart(pair: str = "EURUSD", timeframe: str = "H1", candles: int = 500)
         # candle range + body size so the chart still has a meaningful volume pane.
         volume = int(rng / pip_sz * 37 + abs(float(row["close"]) - float(row["open"])) / pip_sz * 20)
         records.append({
-            "time": int(pd.Timestamp(ts).timestamp()), "open": round(float(row["open"]),5), # type: ignore
+            "time": to_unix_utc(ts), "open": round(float(row["open"]),5), # type: ignore
             "high": round(float(row["high"]),5), "low": round(float(row["low"]),5),
             "close": round(float(row["close"]),5), "ema20": round(float(row["ema20"]),5),
             "ema50": round(float(row["ema50"]),5), "bb_up": round(float(row["bb_up"]),5),
@@ -1947,7 +1947,7 @@ async def ws_candles(websocket: WebSocket, pair: str = "EURUSD", timeframe: str 
                 live_price = quote.get("bid") or quote.get("price")
                 row = df.iloc[-1]
                 forming = {
-                    "time": int(pd.Timestamp(df.index[-1]).timestamp()),
+                    "time": to_unix_utc(df.index[-1]),
                     "open": round(float(row["open"]), 5),
                     "high": round(max(float(row["high"]), live_price), 5) if live_price else round(float(row["high"]),5),
                     "low":  round(min(float(row["low"]), live_price), 5) if live_price else round(float(row["low"]),5),
