@@ -27,6 +27,7 @@ from payments import router as payments_router
 from mpesa import router as mpesa_router
 from bridge import router as bridge_router, check_stale_bridges
 from prefs import router as prefs_router
+from news import router as news_router
 import pandas as pd
 import time
        
@@ -144,6 +145,7 @@ app.include_router(payments_router)
 app.include_router(mpesa_router)
 app.include_router(bridge_router)
 app.include_router(prefs_router)
+app.include_router(news_router)
 # ── Auth Routes ───────────────────────────────────────────────────────────────
 @app.post("/auth/register")
 def register(req: RegisterReq):
