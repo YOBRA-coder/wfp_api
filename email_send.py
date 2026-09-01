@@ -35,7 +35,9 @@ def send_email(to_email: str, subject: str, html_body: str) -> bool:
         msg["To"] = to_email
         msg.attach(MIMEText(html_body, "html"))
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            #server.starttls()
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_USER, to_email, msg.as_string())
         return True
