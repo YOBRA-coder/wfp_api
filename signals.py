@@ -12,7 +12,7 @@ from typing import Optional
 import urllib.request, urllib.error
 
 # ── Twelve Data free API (no key needed for basic quotes) ─────────────────────
-TWELVE_DATA_KEY = "5cbcad973636448dab23c1c8614ed474"  # Optional: get free key at twelvedata.com for more calls
+TWELVE_DATA_KEY = ""  # 5cbcad973636448dab23c1c8614ed474 Optional: get free key at twelvedata.com for more calls
 
 PAIR_CONFIG = {
     # ── Majors ──
