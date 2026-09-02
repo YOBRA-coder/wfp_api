@@ -11,9 +11,10 @@ from signals import PAIR_CONFIG, pip_value_usd
 
 # Optional dependencies — best-effort, never break a trade close if these fail.
 try:
-    from push_send import send_push
+    from push_send import send_push, notify_user
 except Exception:
     send_push = None
+    notify_user = None
 try:
     from telegram_send import send_telegram_message
 except Exception:
@@ -72,11 +73,12 @@ def apply_trade_close(db, trade_id: int, close_price: float, pnl_pips: float, pn
                   close_price=?, closed_at=datetime('now'), commission_usd=? WHERE id=?""",
                (result, round(pnl_pips, 1), pnl_usd, close_price, commission, trade_id))
     db.execute("UPDATE users SET balance = balance + ? WHERE id=?", (payout, follower_id))
-    db.execute("""INSERT INTO trade_journal
-        (user_id,pair,direction,entry_price,exit_price,lot_size,pnl_usd,pnl_pips,notes,setup)
-        VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (follower_id, t["pair"], t["direction"], t["entry_price"], close_price, t["lot_size"], pnl_usd, pnl_pips,
-         notes, "Auto (Own Trade)" if t["is_master"] else "Auto (Copy Trade)"))
+    # NOTE: we deliberately do NOT also insert a trade_journal row here. Every
+    # closed copy_trades row is already reconstructed and shown in the Journal
+    # by GET /journal (it queries copy_trades directly, tagged source='copy').
+    # Inserting into trade_journal as well used to make each closed copy trade
+    # show up TWICE in the journal list — once via this insert, once via that
+    # query. trade_journal is reserved for the user's own hand-typed entries.
 
     if commission > 0:
         db.execute("""INSERT INTO provider_earnings
@@ -86,9 +88,13 @@ def apply_trade_close(db, trade_id: int, close_price: float, pnl_pips: float, pn
         db.execute("UPDATE users SET balance = balance + ? WHERE id=?", (commission, provider_id))
         db.execute("UPDATE providers SET total_earned_usd = total_earned_usd + ? WHERE user_id=?",
                    (commission, provider_id))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-            (provider_id, "billing", "Performance fee earned",
-             f"${commission:.2f} ({commission_pct}% of ${pnl_usd:.2f} profit) from a follower's closed trade."))
+        fee_title = "Performance fee earned"
+        fee_msg = f"${commission:.2f} ({commission_pct}% of ${pnl_usd:.2f} profit) from a follower's closed trade."
+        if notify_user:
+            notify_user(db, provider_id, "billing", fee_title, fee_msg, "/billing")
+        else:
+            db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
+                (provider_id, "billing", fee_title, fee_msg))
 
     closed_ids = [trade_id]
     if t["is_master"]:
@@ -102,8 +108,16 @@ def apply_trade_close(db, trade_id: int, close_price: float, pnl_pips: float, pn
             l_result = "win" if l_pnl > 0 else ("loss" if l_pnl < 0 else "breakeven")
             closed_ids += apply_trade_close(db, l["id"], close_price, l_pips, l_pnl, l_result,
                                              "Closed — the provider you're copying exited their position")
-            db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                (lt["follower_id"], "trade_closed", f"{lt['pair']} closed — provider exited",
-                 f"The provider you're copying closed their position, so this closed too. {l_pnl:+.2f} USD"))
-            _push_to_user(db, lt["follower_id"], f"{lt['pair']} closed — provider exited", f"{l_pnl:+.2f} USD", "/copy")
+            cascade_title = f"{lt['pair']} closed — provider exited"
+            cascade_msg = f"The provider you're copying closed their position, so this closed too. {l_pnl:+.2f} USD"
+            if notify_user:
+                # notify_user writes the row AND fires push in one call, respecting
+                # this follower's per-category push preference — the old code
+                # inserted the row directly then always pushed via _push_to_user,
+                # ignoring that preference entirely.
+                notify_user(db, lt["follower_id"], "trade_closed", cascade_title, cascade_msg, "/copy")
+            else:
+                db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
+                    (lt["follower_id"], "trade_closed", cascade_title, cascade_msg))
+                _push_to_user(db, lt["follower_id"], cascade_title, f"{l_pnl:+.2f} USD", "/copy")
     return closed_ids

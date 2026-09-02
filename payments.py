@@ -38,6 +38,7 @@ from fastapi import APIRouter, Request, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from database import get_db
+from push_send import notify_user
 
 # ── Stripe config ─────────────────────────────────────────────────────────────
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_YOUR_KEY_HERE")
@@ -216,11 +217,8 @@ async def _on_checkout_complete(session: dict):
         if kind == "registration":
             db.execute("UPDATE users SET registration_paid=1, stripe_customer_id=? WHERE id=?",
                        (customer_id, int(user_id)))
-            db.execute(
-                "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
-                (int(user_id), "system", "Registration Complete ✅",
-                 "Your one-time registration fee has been received. Welcome to ForexPro!")
-            )
+            notify_user(db, int(user_id), "system", "Registration Complete ✅",
+                        "Your one-time registration fee has been received. Welcome to ForexPro!", "/billing")
             print(f"Webhook: User {user_id} completed registration payment")
             return
 
@@ -241,11 +239,8 @@ async def _on_checkout_complete(session: dict):
         if db_role:
             db.execute("UPDATE users SET role=? WHERE id=?", (db_role, int(user_id)))
 
-        db.execute(
-            "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
-            (int(user_id), "system", "Payment Successful",
-             f"Your {plan} plan is now active. Thank you!")
-        )
+        notify_user(db, int(user_id), "billing", "Payment Successful",
+                    f"Your {plan} plan is now active. Thank you!", "/billing")
 
     print(f"Webhook: User {user_id} upgraded to {db_plan} (plan={plan})")
 
@@ -263,11 +258,8 @@ async def _on_payment_succeeded(invoice: dict):
                 "UPDATE users SET subscription_status='active', subscription_expires_at=? WHERE id=?",
                 (expires, user["id"])
             )
-            db.execute(
-                "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
-                (user["id"], "system", "Payment Received",
-                 f"Your subscription payment of ${amount:.2f} was successful. Thank you!")
-            )
+            notify_user(db, user["id"], "billing", "Payment Received",
+                        f"Your subscription payment of ${amount:.2f} was successful. Thank you!", "/billing")
 
 async def _on_payment_failed(invoice: dict):
     """Payment failed — notify user, maybe downgrade plan."""
@@ -278,11 +270,8 @@ async def _on_payment_failed(invoice: dict):
         user = db.execute("SELECT id FROM users WHERE stripe_customer_id=?", (customer_id,)).fetchone()
         if user:
             db.execute("UPDATE users SET subscription_status='past_due' WHERE id=?", (user["id"],))
-            db.execute(
-                "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
-                (user["id"], "system", "Payment Failed ⚠️",
-                 "Your subscription payment failed. Please update your payment method to keep access.")
-            )
+            notify_user(db, user["id"], "billing", "Payment Failed ⚠️",
+                        "Your subscription payment failed. Please update your payment method to keep access.", "/billing")
 
 async def _on_subscription_cancelled(sub: dict):
     """Subscription cancelled — downgrade to free."""
@@ -294,11 +283,8 @@ async def _on_subscription_cancelled(sub: dict):
                 "UPDATE users SET plan='free', stripe_sub_id=NULL, subscription_status='cancelled' WHERE id=?",
                 (user["id"],)
             )
-            db.execute(
-                "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
-                (user["id"], "system", "Subscription Cancelled",
-                 "Your subscription has been cancelled. You've been moved to the free plan.")
-            )
+            notify_user(db, user["id"], "billing", "Subscription Cancelled",
+                        "Your subscription has been cancelled. You've been moved to the free plan.", "/billing")
     print(f"Webhook: Customer {customer_id} cancelled subscription")
 
 async def _on_subscription_updated(sub: dict):
@@ -346,11 +332,19 @@ async def get_plans():
         "registration_fee": {"usd": REGISTRATION_FEE_USD, "kes": REGISTRATION_FEE_KES,
                               "note": "One-time fee charged once per account before full access."},
         "plans": [
+            # Feature copy below is kept 1:1 with the actual enforced limits in
+            # database.py's PLAN_LIMITS — it used to be vaguer marketing copy
+            # ("Unlimited everything" on Elite, which doesn't actually include
+            # provider access; no plan mentioned the free tier's 3-copy/day cap
+            # or that bulk signal generation is a paid-only feature), which is
+            # exactly the kind of gap that leaves a client unsure what they're
+            # actually paying for.
             {
                 "id":       "free",
                 "name":     "Free",
                 "price_usd": 0, "price_kes": 0,
-                "features": ["5 signals/day", "1 provider copy", "Basic education"],
+                "features": ["5 signals/day", "Follow 1 provider", "Up to 3 copy trades/day",
+                             "Basic education courses"],
                 "cta":      "Get Started",
             },
             {
@@ -359,7 +353,8 @@ async def get_plans():
                 "price_usd": 9.99, "price_kes": SUBSCRIPTION_PRICES_KES["trader_pro"],
                 "per":      "month",
                 "price_id": PRICES["trader_pro"],
-                "features": ["Unlimited signals", "3 provider copies", "All education courses", "Email alerts"],
+                "features": ["Unlimited signals/day", "Follow up to 3 providers", "Unlimited copy trades/day",
+                             "Bulk signal generation", "All education courses", "Email alerts"],
                 "cta":      "Start Pro",
                 "popular":  True,
             },
@@ -369,7 +364,9 @@ async def get_plans():
                 "price_usd": 29.99, "price_kes": SUBSCRIPTION_PRICES_KES["trader_elite"],
                 "per":      "month",
                 "price_id": PRICES["trader_elite"],
-                "features": ["Unlimited everything", "Priority support", "Telegram alerts", "Backtesting engine"],
+                "features": ["Unlimited signals & copy trades/day", "Follow unlimited providers",
+                             "Bulk signal generation", "Backtesting engine", "Telegram alerts", "Priority support"],
+                "note":     "Doesn't include Signal Provider access — see the Signal Provider plan for that.",
                 "cta":      "Go Elite",
             },
             {
@@ -378,7 +375,8 @@ async def get_plans():
                 "price_usd": 29.99, "price_kes": SUBSCRIPTION_PRICES_KES["provider_pro"],
                 "per":      "month",
                 "price_id": PRICES["provider_pro"],
-                "features": ["Verified badge", "Unlimited followers", "Analytics dashboard", "Revenue sharing"],
+                "features": ["Everything in Elite Trader, plus:", "Verified provider badge", "Unlimited followers",
+                             "Performance analytics dashboard", "Revenue share on follower commissions"],
                 "cta":      "Become Provider",
             },
         ]

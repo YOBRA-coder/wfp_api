@@ -791,6 +791,11 @@ def run_backtest(pair: str, timeframe: str, bars: int = 1000, seed: int = 7) -> 
                     "entry_time": open_trade["entry_time"], "direction": open_trade["direction"],
                     "entry": round(open_trade["entry"], 5), "exit": round(exit_price, 5),
                     "result": result, "pips": round(pips, 1), "confidence": open_trade["confidence"],
+                    # sl/tp were already tracked internally to decide the win/loss above but
+                    # never made it into the response — added so the UI can show/plot the
+                    # actual levels behind a trade, not just its entry/exit/result.
+                    "sl": round(open_trade["sl"], 5), "tp": round(open_trade["tp"], 5),
+                    "pair": pair, "timeframe": timeframe,
                 })
                 open_trade = None
             continue

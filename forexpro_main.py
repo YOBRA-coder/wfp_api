@@ -220,6 +220,11 @@ def login(req: LoginReq):
             "subscription_status": user["subscription_status"] or "inactive",
             "subscription_expires_at": user["subscription_expires_at"],
             "subscription_active": is_subscription_active(dict(user)),
+            # Was missing here — App.jsx gates the Risk Disclaimer popup on this
+            # field, so a returning user who had already accepted it still saw
+            # it flash on every login (until the follow-up /auth/me call, which
+            # does SELECT *, quietly corrected it a moment later).
+            "risk_disclaimer_accepted_at": user["risk_disclaimer_accepted_at"],
         }}
 
 @app.post("/auth/forgot-password")
@@ -704,30 +709,87 @@ def _activate_manual_signal(db, provider_id: int, sig_id: int, req_or_row, prow)
 
 @app.post("/signals/bulk")
 def bulk_signals(req: BulkSignalReq, user=Depends(get_current_user)):
+    """Generate signals for several pair/timeframe combos at once. This used to
+    be a preview-only scan that never touched the signals table at all — it
+    just returned the results and broadcast the top 3 straight out over the
+    websocket, completely bypassing the provider-approval gate that
+    /signals/generate enforces (a provider with subscribers must confirm a
+    signal before it reaches followers). That meant "Generate All" silently
+    auto-sent to clients while single-generate correctly held signals for
+    review. Bulk now persists each signal the same way single-generate does —
+    same approval_status logic, same hold-until-approved behavior, same
+    subscriber distribution only once approved — so a provider with followers
+    always has to review before anything reaches them, regardless of which
+    button they used."""
     limits = plan_limits(effective_plan(user))
     if not limits["bulk_generate"]:
         raise HTTPException(403, "Bulk signal generation requires a Pro plan or above. Upgrade to unlock it.")
-    results = []
-    seed_base = int(datetime.now().strftime("%Y%m%d%H"))
-    for p in req.pairs:
-        for tf in req.timeframes:
-            if p not in PAIR_CONFIG or tf not in TF_MAP: continue
-            try:
-                from signals import synthetic_ohlcv
-                df = synthetic_ohlcv(p, tf, 300, seed=seed_base + abs(hash(p+tf))%1000)
-                df = add_indicators(df)
-                sig = build_signal(p, tf, df, provider_id=user["id"])
-                ohlcv = sig.pop("ohlcv", None)
-                if sig["confidence"] >= req.min_confidence:
-                    if req.direction_filter == "ALL" or sig["direction"] == req.direction_filter:
-                        results.append({**sig, "ohlcv": ohlcv})
-            except Exception as e:
-                results.append({"pair": p, "timeframe": tf, "error": str(e)})
-    results.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-    for sig in results[:3]:
-        if "error" not in sig:
-            broadcast_threadsafe("signals", {"type": "new_signal", "data": sig})
-    return {"count": len(results), "signals": results}
+
+    with get_db() as db:
+        is_provider = db.execute("SELECT 1 FROM providers WHERE user_id=? AND is_active=1", (user["id"],)).fetchone()
+        sub_count = 0
+        if is_provider:
+            sub_count = db.execute("SELECT COUNT(*) c FROM subscriptions WHERE provider_id=? AND is_active=1",
+                                    (user["id"],)).fetchone()["c"]
+        approval_status = "pending_review" if (is_provider and sub_count > 0) else "approved"
+        provider_name = db.execute("SELECT username FROM users WHERE id=?", (user["id"],)).fetchone()["username"]
+
+        results = []
+        seed_base = int(datetime.now().strftime("%Y%m%d%H"))
+        for p in req.pairs:
+            for tf in req.timeframes:
+                if p not in PAIR_CONFIG or tf not in TF_MAP: continue
+                try:
+                    from signals import synthetic_ohlcv
+                    df = synthetic_ohlcv(p, tf, 300, seed=seed_base + abs(hash(p+tf))%1000)
+                    df = add_indicators(df)
+                    sig = build_signal(p, tf, df, provider_id=user["id"])
+                    if sig["direction"] == "NO_TRADE":
+                        continue  # nothing tradeable — not a signal to persist or send
+                    if sig["confidence"] < req.min_confidence: continue
+                    if req.direction_filter != "ALL" and sig["direction"] != req.direction_filter: continue
+
+                    ohlcv = sig.pop("ohlcv", None)
+                    chart_data = {
+                        "ohlcv": ohlcv,
+                        "markers": sig.get("markers", []),
+                        "support_resistance": sig.get("support_resistance", []),
+                        "trendline": sig.get("trendline"),
+                    }
+                    cur = db.execute("""
+                        INSERT INTO signals (provider_id,pair,timeframe,direction,strength,confidence,
+                        entry_price,stop_loss,take_profit,sl_pips,tp_pips,risk_reward,rsi,macd,
+                        ema20,ema50,bb_upper,bb_lower,stoch_k,atr,candle_pattern,chart_pattern,
+                        entry_time,ai_analysis,expires_at,chart_data,approval_status)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (user["id"], sig["pair"], sig["timeframe"], sig["direction"], sig["strength"],
+                          sig["confidence"], sig["entry_price"], sig["stop_loss"], sig["take_profit"],
+                          sig["sl_pips"], sig["tp_pips"], sig["risk_reward"], sig["rsi"], sig["macd"],
+                          sig["ema20"], sig["ema50"], sig["bb_upper"], sig["bb_lower"], sig["stoch_k"],
+                          sig["atr"], sig["candle_pattern"], sig["chart_pattern"], sig["entry_time"],
+                          sig["ai_analysis"], sig["expires_at"], json.dumps(chart_data), approval_status))
+                    sig_id = cur.lastrowid
+
+                    copies_created = 0
+                    if approval_status == "approved":
+                        copies_created = _distribute_signal_to_subscribers(db, sig_id, sig, user["id"], provider_name)
+
+                    sig["id"] = sig_id
+                    sig["approval_status"] = approval_status
+                    sig["needs_approval"] = approval_status == "pending_review"
+                    sig["copies_distributed"] = copies_created
+                    sig["ohlcv"] = ohlcv
+                    results.append(sig)
+                except Exception as e:
+                    results.append({"pair": p, "timeframe": tf, "error": str(e)})
+
+        results.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        if approval_status == "approved":
+            for sig in results[:3]:
+                if "error" not in sig:
+                    broadcast_threadsafe("signals", {"type": "new_signal", "data": sig})
+        return {"count": len(results), "signals": results,
+                "needs_approval": approval_status == "pending_review"}
 
 def sync_equity(db, user_id: int) -> float:
     """balance + unrealized P&L of open SIMULATED trades only, using a fresh
@@ -815,9 +877,17 @@ def backtest_signal_engine(pair: str = "EURUSD", timeframe: str = "H1", bars: in
 @app.get("/signals/history")
 def signal_history(pair: str = "EURUSD", timeframe: str = "H1", period: str = "1M",
                    user=Depends(get_optional_user)):
+    """Was always built off synthetic_ohlcv (a random walk with a fixed seed),
+    so this looked like real trading history but was actually the same fake
+    data on every load, unrelated to what actually happened on the pair.
+    Now goes through get_ohlcv — the same real-data-first, synthetic-only-as-
+    fallback path /signals/generate and Live Prices already use — so history
+    reflects real price action whenever a live data source is available, and
+    only degrades to synthetic if it genuinely isn't (in which case the
+    response below still says so via `data_source`)."""
     n = {"1M":180,"3M":360,"6M":540,"1Y":720}.get(period, 180)
-    from signals import synthetic_ohlcv
-    df = synthetic_ohlcv(pair, timeframe, n+250, seed=42+abs(hash(pair))%100)
+    df = get_ohlcv(pair, timeframe, n+250)
+    data_source = "live" if len(df) >= n + 100 else "synthetic (live data unavailable for this range)"
     df = add_indicators(df)
     signals = []; step = max(1, n//35)
     for i in range(len(df)-step, 250+step, -step):
@@ -828,7 +898,7 @@ def signal_history(pair: str = "EURUSD", timeframe: str = "H1", period: str = "1
         except: pass
     signals.sort(key=lambda x: str(x.get("expires_at","")))
     wins = sum(1 for s in signals if s["confidence"] > 62)
-    return {"pair": pair, "timeframe": timeframe, "period": period,
+    return {"pair": pair, "timeframe": timeframe, "period": period, "data_source": data_source,
             "count": len(signals), "estimated_winrate": round(wins/max(len(signals),1)*100,1),
             "signals": signals}
 
@@ -1236,7 +1306,32 @@ def get_provider(provider_id: int, user=Depends(get_optional_user)):
         signals = db.execute(
             "SELECT * FROM signals WHERE provider_id=? ORDER BY created_at DESC LIMIT 20",
             (p["user_id"],)).fetchall()
-        return {**dict(p), "recent_signals": [dict(s) for s in signals]}
+        sig_rows = [_expand_signal(s) for s in signals]
+        # Followers only ever see "X% win rate" — no way to see who actually
+        # copied a given signal or how it went for them individually. This
+        # doesn't expose other followers' identities (privacy), just the
+        # count and the aggregate outcome, similar to what an exchange's
+        # public copy-trade feed shows.
+        if sig_rows:
+            sig_ids = [s["id"] for s in sig_rows]
+            qmarks = ",".join("?" * len(sig_ids))
+            copy_stats = db.execute(f"""
+                SELECT signal_id, COUNT(*) copiers,
+                       SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) still_open,
+                       SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) wins,
+                       SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) losses,
+                       AVG(CASE WHEN status='closed' THEN pnl_pips END) avg_pips
+                FROM copy_trades WHERE signal_id IN ({qmarks}) GROUP BY signal_id
+            """, sig_ids).fetchall()
+            stats_by_sig = {r["signal_id"]: dict(r) for r in copy_stats}
+            for s in sig_rows:
+                cs = stats_by_sig.get(s["id"])
+                s["copiers_count"] = cs["copiers"] if cs else 0
+                s["copiers_still_open"] = (cs["still_open"] if cs else 0) or 0
+                s["copiers_wins"] = (cs["wins"] if cs else 0) or 0
+                s["copiers_losses"] = (cs["losses"] if cs else 0) or 0
+                s["copiers_avg_pips"] = round(cs["avg_pips"], 1) if cs and cs["avg_pips"] is not None else None
+        return {**dict(p), "recent_signals": sig_rows}
 
 @app.post("/copy/subscribe")
 def subscribe(req: SubscribeReq, user=Depends(get_current_user)):
